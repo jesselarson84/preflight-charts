@@ -1,0 +1,85 @@
+name: Publish chart
+
+# Rebuilds the chart from the FAA's current data every week and publishes it as a release the
+# Preflight app reads. The FAA updates airports and frequencies every 28 days, airspace with the
+# 56-day chart cycle and obstacles daily, so a weekly build is never more than a week behind.
+on:
+  schedule:
+    - cron: "17 9 * * 4"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build layers from FAA sources
+        shell: bash
+        run: |
+          mkdir -p build
+          python3 scripts/build_chart.py build/chart 2>&1 | tee build/build.log
+
+      - name: Cache tippecanoe
+        id: tippecanoe
+        uses: actions/cache@v4
+        with:
+          path: ~/tippecanoe
+          key: tippecanoe-2.53.0
+
+      - name: Build tippecanoe
+        if: steps.tippecanoe.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq build-essential libsqlite3-dev zlib1g-dev
+          git clone -q --depth 1 --branch 2.53.0 https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src \
+            || git clone -q --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe-src
+          make -C /tmp/tippecanoe-src -j4 >/dev/null
+          mkdir -p ~/tippecanoe && cp /tmp/tippecanoe-src/tippecanoe ~/tippecanoe/
+
+      - name: Pack tiles
+        run: |
+          cd build/chart
+          ~/tippecanoe/tippecanoe -q -o faa.pmtiles --force -Z4 -z13 -r1 \
+            --drop-densest-as-needed --extend-zooms-if-still-dropping \
+            -L airspace:airspace.geojson -L sua:sua.geojson -L modec:modec.geojson -L laanc:laanc.geojson \
+            -L airports:airports.geojson -L runways:runways.geojson -L navaids:navaids.geojson \
+            -L obstacles:obstacles.geojson
+          ls -la faa.pmtiles
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/chart
+          tag="chart-$(date -u +%Y%m%d)-${{ github.run_number }}"
+          cycle=$(python3 -c "import json; print(json.load(open('cycle.json'))['cycle'])")
+          python3 - "$tag" <<'PY'
+          import json, sys
+          tag = sys.argv[1]
+          meta = json.load(open("cycle.json"))
+          meta["pmtiles"] = f"https://github.com/${{ github.repository }}/releases/download/{tag}/faa.pmtiles"
+          json.dump(meta, open("manifest.json", "w"), indent=2)
+          PY
+          cat manifest.json
+          gh release create "$tag" faa.pmtiles manifest.json cycle.json \
+            --repo "$GITHUB_REPOSITORY" --title "Chart data, NASR cycle $cycle" \
+            --notes "Built $(date -u +%Y-%m-%d) from FAA sources. Counts: $(python3 -c "import json; print(json.load(open('cycle.json'))['counts'])")" \
+            --latest
+
+      - name: Keep the last four releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[4:] | .[].tagName' \
+            | while read -r tag; do gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag; done
