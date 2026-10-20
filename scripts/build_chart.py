@@ -156,10 +156,13 @@ def airspace_layer(feats):
             kind = cls
         elif cls == "E" or local.startswith("CLASS_E"):
             # The local type is the reliable signal; the floor fills in when it's missing.
-            if local in ("CLASS_E2", "CLASS_E3", "CLASS_E4") or lo_ft == 0:
-                kind = "E_SFC"
-            elif local == "CLASS_E5" or lo_ft in (700, 1200):
+            # E5 rows often carry a zero floor, so they're checked before the floor is.
+            if local == "CLASS_E5":
                 kind = "E_1200" if lo_ft is not None and lo_ft >= 1200 else "E_700"
+            elif local in ("CLASS_E2", "CLASS_E3", "CLASS_E4") or lo_ft == 0:
+                kind = "E_SFC"
+            elif lo_ft in (700, 1200):
+                kind = "E_1200" if lo_ft >= 1200 else "E_700"
             else:
                 kind = "E_OTHER"
         else:
