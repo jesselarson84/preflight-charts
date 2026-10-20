@@ -49,7 +49,7 @@ jobs:
       - name: Pack tiles
         run: |
           cd build/chart
-          ~/tippecanoe/tippecanoe -q -o faa.pmtiles --force -Z4 -z13 -r1 \
+          ~/tippecanoe/tippecanoe -q -o faa.pmtiles --force -Z4 -z13 -r1 -b 64 \
             --drop-densest-as-needed --extend-zooms-if-still-dropping \
             -L airspace:airspace.geojson -L sua:sua.geojson -L modec:modec.geojson -L laanc:laanc.geojson \
             -L airports:airports.geojson -L runways:runways.geojson -L navaids:navaids.geojson \

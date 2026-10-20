@@ -167,12 +167,12 @@ def airspace_layer(feats):
                 kind = "E_OTHER"
         else:
             continue
-        # Shelf label as printed: ceiling over floor for B and C, [ceiling] for D.
+        # Shelf label as printed: ceiling over floor for B and C, the ceiling for D (the app frames it).
         label = ""
         if kind in ("B", "C") and hi_txt is not None and lo_txt is not None:
             label = f"{hi_txt}\n{lo_txt}"
         elif kind == "D" and hi_txt:
-            label = f"[{hi_txt}]"
+            label = hi_txt
         out.append(feature(f["geometry"], {
             "kind": kind,
             "name": p.get("NAME") or "",
@@ -262,14 +262,58 @@ def col(row, *names):
     return ""
 
 
-def airports_layer(rows):
-    longest, lit = {}, set()
+HARD_SURFACES = ("ASPH", "CONC", "BITU", "PEM", "PFC")
+
+
+def hard_surface(code):
+    """Asphalt, concrete and the like; NASR combines codes such as ASPH-TURF, so the first part decides."""
+    return up(code).split("-")[0].split("/")[0] in HARD_SURFACES
+
+
+def runway_info(rows):
+    """Per airport: longest runway, longest hard runway and its true heading, and whether any is lit."""
+    heading = {}
+    for r in rows["APT_RWY_END"]:
+        key = (col(r, "SITE_NO"), col(r, "RWY_ID"))
+        if key not in heading:
+            t = num(col(r, "TRUE_ALIGNMENT"))
+            if t is not None:
+                heading[key] = t % 180
+    info = {}
     for r in rows["APT_RWY"]:
-        site = col(r, "SITE_NO")
+        site, rid = col(r, "SITE_NO"), col(r, "RWY_ID")
         length = num(col(r, "RWY_LEN")) or 0
-        longest[site] = max(longest.get(site, 0), length)
+        i = info.setdefault(site, {"longest": 0, "hard": 0, "hdg": None, "lit": False, "hard_count": 0})
+        i["longest"] = max(i["longest"], length)
+        if hard_surface(col(r, "SURFACE_TYPE_CODE")) and not rid.upper().startswith("H"):
+            i["hard_count"] += 1
+            if length > i["hard"]:
+                i["hard"] = length
+                i["hdg"] = heading.get((site, rid))
         if col(r, "RWY_LGT_CODE") not in ("", "NONE", "NSTD"):
-            lit.add(site)
+            i["lit"] = True
+    return info
+
+
+# FAA chart symbol for each airport, as in the sectional legend.
+def airport_symbol(site_type, private, military, info):
+    if site_type == "H":
+        return "heli"
+    if site_type == "S":
+        return "sea"
+    if site_type == "U":
+        return "ultra"
+    if private:
+        return "pvt"
+    if info["hard"] > 8069:
+        return "big"
+    if info["hard"] >= 1500:
+        return "hard"
+    return "mil" if military else "soft"
+
+
+def airports_layer(rows):
+    rinfo = runway_info(rows)
 
     freqs = {}
     for r in rows["FRQ"]:
@@ -297,21 +341,28 @@ def airports_layer(rows):
         site_type = up(col(r, "SITE_TYPE_CODE"))  # A airport, H heliport, S seaplane, U ultralight, G glider, B balloon
         towered = up(col(r, "TWR_TYPE_CODE")).startswith("ATCT")
         private = up(col(r, "FACILITY_USE_CODE")) == "PR"
+        military = up(col(r, "OWNERSHIP_TYPE_CODE")) in ("MA", "MN", "MR", "CG")
+        info = rinfo.get(col(r, "SITE_NO"), {"longest": 0, "hard": 0, "hdg": None, "lit": False, "hard_count": 0})
         f = freqs.get(ident, {})
-        rwy = int(longest.get(col(r, "SITE_NO"), 0))
+        rwy = int(info["longest"])
+        symbol = airport_symbol(site_type, private, military, info)
         major = towered and rwy >= 8000
         out.append(feature({"type": "Point", "coordinates": [lon, lat]}, {
             "id": ident,
             "icao": col(r, "ICAO_ID"),
-            "name": col(r, "ARPT_NAME").title(),
+            "name": col(r, "ARPT_NAME").upper(),
             "type": site_type or "A",
+            "symbol": symbol,
+            "hdg": round(info["hdg"]) if info["hdg"] is not None else 0,
             "towered": towered,
             "private": private,
+            "military": military,
             "elev": int(num(col(r, "ELEV")) or 0),
             "rwy": rwy,
             # Runway length in hundreds of feet, as printed; heliports and tiny strips get none.
             "rwy_label": str(round(rwy / 100)) if site_type in ("", "A") and rwy >= 1000 else "",
-            "lit": col(r, "SITE_NO") in lit,
+            "lit": info["lit"],
+            "beacon": bool(col(r, "BCN_LENS_COLOR")) and up(col(r, "BCN_LENS_COLOR")) not in ("N", "NONE"),
             "fuel": bool(col(r, "FUEL_TYPES")),
             "ctaf": col(r, "CTAF_FREQ") or f.get("ctaf", ""),
             "twr": f.get("twr", ""),
@@ -321,7 +372,13 @@ def airports_layer(rows):
     return out
 
 
-def runways_layer(rows):
+def runways_layer(rows, airports):
+    """Runway outlines for the airports the sectional draws as a runway pattern."""
+    by_site = {}
+    for r in rows["APT_BASE"]:
+        by_site[col(r, "SITE_NO")] = col(r, "ARPT_ID")
+    apt = {a["properties"]["id"]: a["properties"] for a in airports}
+    surface = {(col(r, "SITE_NO"), col(r, "RWY_ID")): hard_surface(col(r, "SURFACE_TYPE_CODE")) for r in rows["APT_RWY"]}
     ends = {}
     for r in rows["APT_RWY_END"]:
         lat, lon = num(col(r, "LAT_DECIMAL")), num(col(r, "LONG_DECIMAL"))
@@ -330,8 +387,12 @@ def runways_layer(rows):
         ends.setdefault((col(r, "SITE_NO"), col(r, "RWY_ID")), []).append([lon, lat])
     out = []
     for (site, rwy), pts in ends.items():
-        if len(pts) >= 2:
-            out.append(feature({"type": "LineString", "coordinates": pts[:2]}, {"rwy": rwy}, minzoom=10))
+        a = apt.get(by_site.get(site, ""))
+        if len(pts) < 2 or a is None or not surface.get((site, rwy)):
+            continue
+        out.append(feature({"type": "LineString", "coordinates": pts[:2]}, {
+            "rwy": rwy, "towered": a["towered"], "big": a["symbol"] == "big",
+        }, minzoom=8 if a["symbol"] == "big" else 11))
     return out
 
 
@@ -347,7 +408,8 @@ def navaids_layer(rows):
             "name": col(r, "NAME").title(),
             "type": t,
             "freq": col(r, "FREQ"),
-        }, minzoom=7))
+            # Ident in Morse code is printed in the box; only the letters are carried here.
+        }, minzoom=7 if "VOR" in t or "DME" in t or "TACAN" in t else 9))
     return out
 
 
@@ -376,6 +438,9 @@ def obstacles_layer():
             "type": col(r, "TYPE", "OBSTACLE TYPE").title(),
             "count": int(num(col(r, "QUANTITY")) or 1),
             "tall": agl >= 1000,
+            # High-intensity lights get the flash marks on the chart.
+            "hi": lt in ("H", "S"),
+            "wind": "WIND" in up(col(r, "TYPE", "OBSTACLE TYPE")),
         }, minzoom=7 if agl >= 1000 else 9 if agl >= 500 else 11))
     log(f"obstacles >= 200 ft AGL: {len(out)}")
     return out
@@ -434,7 +499,7 @@ def main():
         "sua": sua_layer(sua),
         "laanc": laanc_layer(laanc),
         "airports": airports,
-        "runways": runways_layer(rows),
+        "runways": runways_layer(rows, airports),
         "navaids": navaids_layer(rows),
         "obstacles": obstacles_layer(),
         "modec": modec_layer(cls),
