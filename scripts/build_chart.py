@@ -155,12 +155,11 @@ def airspace_layer(feats):
         if cls in ("B", "C", "D"):
             kind = cls
         elif cls == "E" or local.startswith("CLASS_E"):
-            if lo_ft == 0 or local in ("CLASS_E2", "CLASS_E3", "CLASS_E4"):
+            # The local type is the reliable signal; the floor fills in when it's missing.
+            if local in ("CLASS_E2", "CLASS_E3", "CLASS_E4") or lo_ft == 0:
                 kind = "E_SFC"
-            elif lo_ft == 700:
-                kind = "E_700"
-            elif lo_ft == 1200:
-                kind = "E_1200"
+            elif local == "CLASS_E5" or lo_ft in (700, 1200):
+                kind = "E_1200" if lo_ft is not None and lo_ft >= 1200 else "E_700"
             else:
                 kind = "E_OTHER"
         else:
@@ -307,14 +306,15 @@ def airports_layer(rows):
             "private": private,
             "elev": int(num(col(r, "ELEV")) or 0),
             "rwy": rwy,
-            "rwy_label": str(round(rwy / 100)) if rwy else "",
+            # Runway length in hundreds of feet, as printed; heliports and tiny strips get none.
+            "rwy_label": str(round(rwy / 100)) if site_type in ("", "A") and rwy >= 1000 else "",
             "lit": col(r, "SITE_NO") in lit,
             "fuel": bool(col(r, "FUEL_TYPES")),
             "ctaf": col(r, "CTAF_FREQ") or f.get("ctaf", ""),
             "twr": f.get("twr", ""),
             "unicom": f.get("unicom", ""),
             "rank": 0 if major else 1 if towered else 2 if not private else 3,
-        }, minzoom=4 if major else 6 if towered else 8 if not private else 10))
+        }, minzoom=4 if major else 6 if towered else 8 if not private else 11))
     return out
 
 
@@ -373,7 +373,7 @@ def obstacles_layer():
             "type": col(r, "TYPE", "OBSTACLE TYPE").title(),
             "count": int(num(col(r, "QUANTITY")) or 1),
             "tall": agl >= 1000,
-        }, minzoom=9 if agl < 1000 else 7))
+        }, minzoom=7 if agl >= 1000 else 9 if agl >= 500 else 11))
     log(f"obstacles >= 200 ft AGL: {len(out)}")
     return out
 
@@ -423,8 +423,11 @@ def main():
     cycle, rows = nasr_tables(today)
     airports = airports_layer(rows)
 
+    airspace = airspace_layer(cls)
+    describe("Airspace kinds drawn", airspace, "kind")
+
     layers = {
-        "airspace": airspace_layer(cls),
+        "airspace": airspace,
         "sua": sua_layer(sua),
         "laanc": laanc_layer(laanc),
         "airports": airports,
