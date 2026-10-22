@@ -130,9 +130,13 @@ def num(v):
 
 
 def limit_text(p, prefix):
-    """Floor or ceiling as a sectional prints it: SFC, or hundreds of feet MSL."""
+    """Floor or ceiling as a sectional prints it: SFC, or hundreds of feet.
+
+    The FAA's code SFC is the reference (feet above the surface), not the value: an E5 floor is
+    700 with code SFC, meaning 700 ft AGL. Only a value of 0 is the surface itself.
+    """
     code, val, uom = up(p.get(f"{prefix}_CODE")), num(p.get(f"{prefix}_VAL")), up(p.get(f"{prefix}_UOM"))
-    if code == "SFC" or (prefix == "LOWER" and val == 0):
+    if val == 0 or (val is None and code == "SFC" and prefix == "LOWER"):
         return "SFC", 0, code or "SFC"
     if val is None or val < 0:
         return None, None, code
@@ -155,11 +159,15 @@ def airspace_layer(feats):
         if cls in ("B", "C", "D"):
             kind = cls
         elif cls == "E" or local.startswith("CLASS_E"):
-            # The local type is the reliable signal; the floor fills in when it's missing.
-            # E5 rows often carry a zero floor, so they're checked before the floor is.
+            # The local type is the reliable signal; the floor fills in only when it's missing.
+            # Only E2, E3 and E4 are surface areas; E5, E6 and E7 never reach the ground.
             if local == "CLASS_E5":
                 kind = "E_1200" if lo_ft is not None and lo_ft >= 1200 else "E_700"
-            elif local in ("CLASS_E2", "CLASS_E3", "CLASS_E4") or lo_ft == 0:
+            elif local in ("CLASS_E2", "CLASS_E3", "CLASS_E4"):
+                kind = "E_SFC"
+            elif local.startswith("CLASS_E") and local != "CLASS_E":
+                kind = "E_OTHER"  # E6 en-route and E7 offshore: not drawn on a sectional
+            elif lo_ft == 0:
                 kind = "E_SFC"
             elif lo_ft in (700, 1200):
                 kind = "E_1200" if lo_ft >= 1200 else "E_700"
@@ -483,6 +491,13 @@ def main():
 
     cls = arcgis_features(CLASS_LAYER)
     describe("Class airspace", cls, "CLASS", "LOCAL_TYPE", "TYPE_CODE")
+    floors = {}
+    for f in cls:
+        p = f.get("properties", {})
+        if up(p.get("CLASS")) == "E" or up(p.get("LOCAL_TYPE")).startswith("CLASS_E"):
+            k = (up(p.get("LOCAL_TYPE")) or "-", up(p.get("LOWER_CODE")) or "-", p.get("LOWER_VAL"), up(p.get("LOWER_UOM")) or "-")
+            floors[k] = floors.get(k, 0) + 1
+    log("  Class E floors (type, code, value, unit): " + ", ".join(f"{k}={n}" for k, n in sorted(floors.items(), key=lambda x: -x[1])[:30]))
     sua = arcgis_features(SUA_LAYER)
     describe("Special use airspace", sua, "TYPE_CODE")
     laanc = arcgis_features(LAANC_LAYER)
