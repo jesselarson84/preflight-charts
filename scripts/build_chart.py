@@ -449,8 +449,10 @@ def obstacles_layer():
             # High-intensity lights get the flash marks on the chart.
             "hi": lt in ("H", "S"),
             "wind": "WIND" in up(col(r, "TYPE", "OBSTACLE TYPE")),
+            # Not verified by the FAA: the chart prints UC under its height.
+            "uc": up(col(r, "VERIFIED STATUS", "VERIFIED")) == "U",
         }, minzoom=7 if agl >= 1000 else 9 if agl >= 500 else 11))
-    log(f"obstacles >= 200 ft AGL: {len(out)}")
+    log(f"obstacles >= 200 ft AGL: {len(out)}, unverified (UC): {sum(1 for f in out if f['properties']['uc'])}")
     return out
 
 
