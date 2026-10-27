@@ -53,7 +53,8 @@ jobs:
             --drop-densest-as-needed --extend-zooms-if-still-dropping \
             -L airspace:airspace.geojson -L sua:sua.geojson -L modec:modec.geojson -L laanc:laanc.geojson \
             -L airports:airports.geojson -L runways:runways.geojson -L navaids:navaids.geojson \
-            -L obstacles:obstacles.geojson
+            -L obstacles:obstacles.geojson -L airways:airways.geojson -L waypoints:waypoints.geojson \
+            -L isogonic:isogonic.geojson -L mef:mef.geojson
           ls -la faa.pmtiles
 
       - name: Publish release

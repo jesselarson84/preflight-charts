@@ -12,6 +12,15 @@ turns it into GeoJSON layers that tippecanoe packs into one PMTiles file the app
   runways    Runway centrelines (NASR)
   navaids    VORs and NDBs with frequencies (NASR)
   obstacles  Obstacles 200 ft and taller, as on a sectional (Digital Obstacle File)
+  airways    Victor airways and T routes, segment by segment, with mileage (NASR)
+  waypoints  VFR waypoints (NASR)
+  isogonic   Isogonic lines every degree, from the World Magnetic Model (NOAA)
+  mef        Maximum elevation figures for each half-degree quadrangle (terrain and DOF)
+
+The FAA publishes no feed of isogonic lines or MEFs, so they're worked out here the way the FAA
+does: declination from the World Magnetic Model coefficients in data/WMM2025.COF, and MEFs from the
+highest terrain in each quadrangle (data/terrain_max.csv, made by terrain_max.py) and the highest
+obstacle in the current Digital Obstacle File.
 
 Standard library only, so it runs on a bare CI runner. Prints a summary of every source so a
 change in the FAA's files shows up in the build log rather than as a silently empty layer.
@@ -247,7 +256,7 @@ def nasr_tables(today):
                 base = os.path.basename(name).upper()
                 if base.endswith(".CSV"):
                     tables[base[:-4]] = name
-            want = ["APT_BASE", "APT_RWY", "APT_RWY_END", "FRQ", "NAV_BASE"]
+            want = ["APT_BASE", "APT_RWY", "APT_RWY_END", "FRQ", "NAV_BASE", "AWY_SEG_ALT", "FIX_BASE"]
             log("  tables:", ", ".join(sorted(tables)))
             rows = {}
             for t in want:
@@ -425,6 +434,7 @@ def navaids_layer(rows):
 
 
 def obstacles_layer():
+    """Obstacles 200 ft and up for the chart, and the highest obstacle top in every quadrangle for the MEFs."""
     data = get(DOF_CSV, binary=True)
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         name = next(n for n in z.namelist() if n.upper().endswith(".CSV"))
@@ -432,10 +442,13 @@ def obstacles_layer():
     reader = csv.DictReader(io.StringIO(text))
     reader.fieldnames = [h.strip().upper() for h in reader.fieldnames]
     log(f"DOF {name}: columns: {', '.join(reader.fieldnames)}")
-    out = []
+    out, highest = [], {}
     for r in reader:
         agl, amsl = num(col(r, "AGL")), num(col(r, "AMSL"))
         lat, lon = num(col(r, "LATDEC")), num(col(r, "LONDEC"))
+        if lat is not None and lon is not None and amsl is not None:
+            q = quadrangle(lat, lon)
+            highest[q] = max(highest.get(q, 0), int(amsl))
         if agl is None or lat is None or lon is None or agl < 200:
             continue
         lt = up(col(r, "LT", "LIGHTING"))
@@ -453,6 +466,294 @@ def obstacles_layer():
             "uc": up(col(r, "VERIFIED STATUS", "VERIFIED")) == "U",
         }, minzoom=7 if agl >= 1000 else 9 if agl >= 500 else 11))
     log(f"obstacles >= 200 ft AGL: {len(out)}, unverified (UC): {sum(1 for f in out if f['properties']['uc'])}")
+    return out, highest
+
+
+# Airways and VFR waypoints ------------------------------------------------------------------
+
+
+def point_index(rows):
+    """Every navaid and fix by identifier, as [(lon, lat)]: one identifier can name several."""
+    points = {}
+    for r in rows["NAV_BASE"]:
+        lat, lon = num(col(r, "LAT_DECIMAL")), num(col(r, "LONG_DECIMAL"))
+        if lat is not None and lon is not None:
+            points.setdefault(up(col(r, "NAV_ID")), []).append((lon, lat))
+    for r in rows["FIX_BASE"]:
+        lat, lon = num(col(r, "LAT_DECIMAL")), num(col(r, "LONG_DECIMAL"))
+        if lat is not None and lon is not None:
+            points.setdefault(up(col(r, "FIX_ID")), []).append((lon, lat))
+    return points
+
+
+def nearest(candidates, near):
+    if not candidates:
+        return None
+    if near is None:
+        return candidates[0]
+    return min(candidates, key=lambda p: (p[0] - near[0]) ** 2 + (p[1] - near[1]) ** 2)
+
+
+def airways_layer(rows):
+    """Victor airways and T routes, the low routes a sectional draws, one feature per segment.
+
+    Airways that share a segment are drawn once and labelled together, as the chart does: V3-140.
+    A segment longer than 300 NM or one the FAA flags as a gap is left out rather than drawn
+    across country it doesn't follow.
+    """
+    points = point_index(rows)
+    routes = {}
+    for r in rows["AWY_SEG_ALT"]:
+        ident = up(col(r, "AWY_ID")).replace(" ", "")
+        if not ident or ident[0] not in "VT" or not ident[1:].isdigit():
+            continue
+        key = (ident, up(col(r, "AWY_LOCATION")))
+        routes.setdefault(key, []).append(r)
+    log(f"airways: {len(routes)} Victor and T routes; point types: " + ", ".join(
+        f"{k}={n}" for k, n in sorted(count_by(rows["AWY_SEG_ALT"], "FROM_PT_TYPE").items(), key=lambda x: -x[1])[:12]))
+    segments, missing = {}, set()
+    for (ident, _), segs in routes.items():
+        segs.sort(key=lambda r: num(col(r, "POINT_SEQ")) or 0)
+        prev = None
+        for i, r in enumerate(segs):
+            a = up(col(r, "FROM_POINT"))
+            b = up(col(r, "TO_POINT")) or (up(col(segs[i + 1], "FROM_POINT")) if i + 1 < len(segs) else "")
+            if prev is None and points.get(b):
+                # The first point of a route: of the places with its name, the one nearest the next point.
+                prev = min(points[b], key=lambda q: min(((q[0] - c[0]) ** 2 + (q[1] - c[1]) ** 2 for c in points.get(a, [q])), default=0))
+            pa = nearest(points.get(a, []), prev)
+            pb = nearest(points.get(b, []), pa)
+            prev = pb
+            if not pa or not pb:
+                missing.update(x for x, p in ((a, pa), (b, pb)) if x and not p)
+                continue
+            if up(col(r, "AWY_SEG_GAP_FLAG")) == "Y" or pa == pb or nm(pa, pb) > 300:
+                continue
+            k = (pa, pb) if pa < pb else (pb, pa)
+            seg = segments.setdefault(k, {"ids": [], "dist": None, "course": None, "from": pa})
+            if ident not in seg["ids"]:
+                seg["ids"].append(ident)
+            if seg["dist"] is None:
+                seg["dist"] = num(col(r, "MAG_COURSE_DIST"))
+                seg["course"] = num(col(r, "MAG_COURSE")) if seg["from"] == pa else num(col(r, "OPP_MAG_COURSE"))
+    if missing:
+        log(f"  {len(missing)} airway points not found, e.g. {sorted(missing)[:10]}")
+    out = []
+    for (pa, pb), seg in segments.items():
+        a, b = seg["from"], pb if seg["from"] == pa else pa
+        out.append(feature({"type": "LineString", "coordinates": [list(a), list(b)]}, {
+            "id": airway_label(seg["ids"]),
+            "victor": any(i.startswith("V") for i in seg["ids"]),
+            "dist": int(round(seg["dist"])) if seg["dist"] else 0,
+            "course": int(round(seg["course"])) % 360 if seg["course"] is not None else -1,
+        }, minzoom=6))
+    log(f"airway segments drawn: {len(out)}")
+    return out
+
+
+def airway_label(ids):
+    """V3, V140 and T201 on one segment print as V3-140 T201."""
+    out = []
+    for prefix in "VT":
+        nums = sorted((i[1:] for i in ids if i.startswith(prefix)), key=int)
+        if nums:
+            out.append(prefix + "-".join(nums))
+    return " ".join(out)
+
+
+def nm(a, b):
+    """Great-circle distance in nautical miles between (lon, lat) points."""
+    la1, la2 = math.radians(a[1]), math.radians(b[1])
+    d = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(math.radians(b[0] - a[0]) / 2) ** 2
+    return 3440.065 * 2 * math.asin(min(1, math.sqrt(d)))
+
+
+def count_by(rows, column):
+    counts = {}
+    for r in rows:
+        v = up(col(r, column)) or "-"
+        counts[v] = counts.get(v, 0) + 1
+    return counts
+
+
+def waypoints_layer(rows):
+    """VFR waypoints: the FAA names them VP and three letters and marks their use VFR."""
+    log("fix use codes: " + ", ".join(f"{k}={n}" for k, n in sorted(count_by(rows["FIX_BASE"], "FIX_USE_CODE").items(), key=lambda x: -x[1])[:15]))
+    out = []
+    for r in rows["FIX_BASE"]:
+        ident = up(col(r, "FIX_ID"))
+        lat, lon = num(col(r, "LAT_DECIMAL")), num(col(r, "LONG_DECIMAL"))
+        if lat is None or lon is None:
+            continue
+        if not (up(col(r, "FIX_USE_CODE")) == "VFR" or (ident.startswith("VP") and len(ident) == 5)):
+            continue
+        out.append(feature({"type": "Point", "coordinates": [lon, lat]}, {"id": ident}, minzoom=8))
+    log(f"VFR waypoints: {len(out)}")
+    return out
+
+
+# Isogonic lines ------------------------------------------------------------------------------
+
+WMM_COF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "WMM2025.COF")
+
+
+class MagneticModel:
+    """The World Magnetic Model (NOAA/BGS), enough of it for declination at sea level."""
+
+    def __init__(self, path=WMM_COF):
+        self.g, self.h, self.gd, self.hd = {}, {}, {}, {}
+        with open(path) as fh:
+            self.epoch = float(fh.readline().split()[0])
+            for line in fh:
+                p = line.split()
+                if len(p) < 6 or line.startswith("9999"):
+                    continue
+                n, m = int(p[0]), int(p[1])
+                self.g[n, m], self.h[n, m], self.gd[n, m], self.hd[n, m] = map(float, p[2:6])
+        self.max_n = max(n for n, _ in self.g)
+
+    def declination(self, lat, lon, year):
+        """Degrees east of true north (negative is west), at sea level."""
+        a, f, re = 6378.137, 1 / 298.257223563, 6371.2
+        e2 = f * (2 - f)
+        phi, lam = math.radians(lat), math.radians(lon)
+        rc = a / math.sqrt(1 - e2 * math.sin(phi) ** 2)
+        p, z = rc * math.cos(phi), rc * (1 - e2) * math.sin(phi)
+        r = math.hypot(p, z)
+        phc = math.asin(z / r)
+        mu, c = math.sin(phc), math.cos(phc)
+        dt = year - self.epoch
+        # Schmidt semi-normalised associated Legendre functions of sin(geocentric latitude).
+        P = {(0, 0): 1.0}
+        for n in range(1, self.max_n + 1):
+            for m in range(n + 1):
+                if m == n:
+                    P[n, m] = c if n == 1 else math.sqrt((2 * n - 1) / (2 * n)) * c * P[n - 1, n - 1]
+                else:
+                    P[n, m] = ((2 * n - 1) * mu * P[n - 1, m] - math.sqrt((n - 1) ** 2 - m * m) * P.get((n - 2, m), 0.0)) / math.sqrt(n * n - m * m)
+        x = y = zz = 0.0
+        for n in range(1, self.max_n + 1):
+            k = (re / r) ** (n + 2)
+            for m in range(n + 1):
+                g = self.g[n, m] + dt * self.gd[n, m]
+                h = self.h[n, m] + dt * self.hd[n, m]
+                cm, sm = math.cos(m * lam), math.sin(m * lam)
+                dp = (-n * mu * P[n, m] + math.sqrt(n * n - m * m) * P.get((n - 1, m), 0.0)) / c
+                x -= k * (g * cm + h * sm) * dp
+                y += k * m * (g * sm - h * cm) * P[n, m] / c
+                zz -= k * (n + 1) * (g * cm + h * sm) * P[n, m]
+        # Back from geocentric to geodetic north.
+        psi = phc - phi
+        north = x * math.cos(psi) - zz * math.sin(psi)
+        return math.degrees(math.atan2(y, north))
+
+
+def contours(grid, lats, lons, level):
+    """Marching squares: the polylines where grid crosses level, joined end to end."""
+    segs = []
+    for i in range(len(lats) - 1):
+        for j in range(len(lons) - 1):
+            corners = [(lats[i], lons[j], grid[i][j]), (lats[i], lons[j + 1], grid[i][j + 1]),
+                       (lats[i + 1], lons[j + 1], grid[i + 1][j + 1]), (lats[i + 1], lons[j], grid[i + 1][j])]
+            cross = []
+            for k in range(4):
+                (y1, x1, v1), (y2, x2, v2) = corners[k], corners[(k + 1) % 4]
+                if (v1 < level) != (v2 < level):
+                    t = (level - v1) / (v2 - v1)
+                    cross.append((round(x1 + t * (x2 - x1), 5), round(y1 + t * (y2 - y1), 5)))
+            if len(cross) == 2:
+                segs.append(tuple(cross))
+            elif len(cross) == 4:
+                segs += [(cross[0], cross[1]), (cross[2], cross[3])]
+    # Join the pieces: every crossing point is shared by the two cells either side of it.
+    ends = {}
+    for s in segs:
+        for p in s:
+            ends.setdefault(p, []).append(s)
+    used, lines = set(), []
+    for s in segs:
+        if s in used:
+            continue
+        used.add(s)
+        line = list(s)
+        for forward in (True, False):
+            while True:
+                tip = line[-1] if forward else line[0]
+                nxt = next((t for t in ends.get(tip, []) if t not in used), None)
+                if nxt is None:
+                    break
+                used.add(nxt)
+                other = nxt[1] if nxt[0] == tip else nxt[0]
+                if forward:
+                    line.append(other)
+                else:
+                    line.insert(0, other)
+        if len(line) > 2:
+            lines.append(line)
+    return lines
+
+
+def isogonic_layer(today):
+    """Lines of equal magnetic variation every degree, for today's date, over the area sectionals cover."""
+    model = MagneticModel()
+    year = today.year + (today.timetuple().tm_yday - 0.5) / 365.25
+    step = 0.25
+    lats = [10 + i * step for i in range(int((75 - 10) / step) + 1)]
+    lons = [-180 + j * step for j in range(int((-60 + 180) / step) + 1)]
+    grid = [[model.declination(la, lo, year) for lo in lons] for la in lats]
+    lo_v = math.floor(min(min(r) for r in grid))
+    hi_v = math.ceil(max(max(r) for r in grid))
+    log(f"isogonic lines: model epoch {model.epoch}, date {year:.2f}, declination {lo_v} to {hi_v} degrees; "
+        f"Denver {model.declination(39.74, -104.99, year):.1f}, Charlotte {model.declination(35.23, -80.84, year):.1f}")
+    out = []
+    for level in range(lo_v, hi_v + 1):
+        label = f"{abs(level)}°{'E' if level > 0 else 'W' if level < 0 else ''}"
+        for line in contours(grid, lats, lons, level):
+            out.append(feature({"type": "LineString", "coordinates": [list(p) for p in line]},
+                               {"deg": level, "label": label}, minzoom=4))
+    return out
+
+
+# Maximum elevation figures -------------------------------------------------------------------
+
+TERRAIN_MAX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "terrain_max.csv")
+
+
+def quadrangle(lat, lon):
+    """South-west corner of the half-degree quadrangle a point is in."""
+    return math.floor(lat * 2) / 2, math.floor(lon * 2) / 2
+
+
+def round_up_100(ft):
+    return int(math.ceil(ft / 100.0) * 100)
+
+
+def mef_layer(highest_obstacle):
+    """A maximum elevation figure in every quadrangle, worked out as the FAA does.
+
+    Terrain: the highest point, plus 200 ft for obstacles too small to chart and 100 ft for
+    vertical error, rounded up to the next 100 ft. Obstacle: its top above sea level plus 100 ft,
+    rounded up. The MEF is the higher of the two. Printed in thousands and hundreds of feet.
+    """
+    terrain = {}
+    with open(TERRAIN_MAX) as fh:
+        for r in csv.DictReader(fh):
+            terrain[float(r["lat"]), float(r["lon"])] = int(r["max_ft"])
+    out, by_obstacle = [], 0
+    for q in sorted(set(terrain) | set(highest_obstacle)):
+        t = round_up_100(terrain[q] + 300) if q in terrain else 0
+        o = round_up_100(highest_obstacle[q] + 100) if q in highest_obstacle else 0
+        mef = max(t, o)
+        if mef <= 0:
+            continue
+        by_obstacle += o > t
+        out.append(feature({"type": "Point", "coordinates": [q[1] + 0.25, q[0] + 0.25]}, {
+            "mef": mef,
+            "thousands": str(mef // 1000),
+            "hundreds": str(mef % 1000 // 100),
+            "obstacle": o > t,
+        }, minzoom=6))
+    log(f"MEFs: {len(out)} quadrangles, {by_obstacle} set by an obstacle")
     return out
 
 
@@ -511,6 +812,7 @@ def main():
     airspace = airspace_layer(cls)
     describe("Airspace kinds drawn", airspace, "kind")
 
+    obstacles, highest_obstacle = obstacles_layer()
     layers = {
         "airspace": airspace,
         "sua": sua_layer(sua),
@@ -518,8 +820,12 @@ def main():
         "airports": airports,
         "runways": runways_layer(rows, airports),
         "navaids": navaids_layer(rows),
-        "obstacles": obstacles_layer(),
+        "obstacles": obstacles,
         "modec": modec_layer(cls),
+        "airways": airways_layer(rows),
+        "waypoints": waypoints_layer(rows),
+        "isogonic": isogonic_layer(today),
+        "mef": mef_layer(highest_obstacle),
     }
     for name, feats in layers.items():
         write(out_dir, name, feats)
